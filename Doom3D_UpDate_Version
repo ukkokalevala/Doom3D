@@ -1,0 +1,516 @@
+// ESP32-C3 SSD1306 Raycaster with Weapon and Enemy
+// Target: ESP32-C3, SSD1306 128x64 (I2C), analog joystick, buzzer
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------- Display config ----------
+#define SCREEN_W 128
+#define SCREEN_H 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, OLED_RESET);
+
+// ---------- Rendering settings ----------
+const int RENDER_W = 64;
+const int SCALE = SCREEN_W / RENDER_W;
+
+// ---------- Pins ----------
+const int JOY_X_PIN = 0;
+const int JOY_Y_PIN = 1;
+const int JOY_BTN_PIN = 2;
+const int BUZZER_PIN = 5;
+
+// ---------- Weapon sprites ----------
+// Improved gun sprite (16x16 pixels) - using uint16_t for larger values
+const uint16_t weaponSprite[2][16] = {
+  { // Frame 0 - Normal
+    0b0000000000000000,
+    0b0000000000000000,
+    0b0000000110000000,
+    0b0000001111000000,
+    0b0000011111100000,
+    0b0000111111110000,
+    0b0001111111111000,
+    0b0011111111111100,
+    0b0111111111111110,
+    0b0111111111111110,
+    0b0011111111111100,
+    0b0001111111111000,
+    0b0000111111110000,
+    0b0000011111100000,
+    0b0000001111000000,
+    0b0000000110000000
+  },
+  { // Frame 1 - Firing
+    0b0000000000000000,
+    0b0000000110000000,
+    0b0000001111000000,
+    0b0000011111100000,
+    0b0000111111110000,
+    0b0001111111111000,
+    0b0011111111111100,
+    0b0111111111111110,
+    0b1111111111111111,
+    0b1111111111111111,
+    0b0111111111111110,
+    0b0011111111111100,
+    0b0001111111111000,
+    0b0000111111110000,
+    0b0000011111100000,
+    0b0000001111000000
+  }
+};
+
+// Muzzle flash sprite (8x8)
+const uint8_t muzzleFlash[8] = {
+  0b00011000,
+  0b00111100,
+  0b01111110,
+  0b11111111,
+  0b11111111,
+  0b01111110,
+  0b00111100,
+  0b00011000
+};
+
+// Enemy sprite (8x8) - Simple monster
+const uint8_t enemySprite[8] = {
+  0b00111100,
+  0b01111110,
+  0b11011011,
+  0b11111111,
+  0b11111111,
+  0b01111110,
+  0b01011010,
+  0b00100100
+};
+
+// ---------- Game State ----------
+float posX = 3.5f, posY = 3.5f;
+float dirX = -1.0f, dirY = 0.0f;
+float planeX = 0.0f, planeY = 0.66f;
+
+// Enemy position and state
+float enemyX = 7.5f, enemyY = 7.5f;
+bool enemyAlive = true;
+float enemyHealth = 100.0f;
+unsigned long lastEnemyMove = 0;
+
+// Weapon state
+int weaponFrame = 0;
+float weaponBob = 0.0f;
+bool weaponMoving = false;
+unsigned long lastWeaponBob = 0;
+unsigned long lastShot = 0;
+unsigned long lastFlash = 0;
+bool isFiring = false;
+int ammo = 30;
+int score = 0;
+
+// Game constants
+const float MOVE_SPEED = 2.8f;
+const float ROT_SPEED  = 1.5f;
+const int MAX_AMMO = 30;
+
+// ---------- Map ----------
+const int MAP_W = 16;
+const int MAP_H = 16;
+const uint8_t worldMap[MAP_H][MAP_W] = {
+  {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,1,1,1,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,1,0,1,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,1,0,1,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,1,0,1,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,1,1,1,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}
+};
+
+// ---------- Timing ----------
+unsigned long lastTime = 0;
+
+// ---------- Audio ----------
+void playSound(int freq, int duration, int pause = 0) {
+  if (freq > 0) {
+    tone(BUZZER_PIN, freq);
+    delay(duration);
+    noTone(BUZZER_PIN);
+  }
+  if (pause > 0) delay(pause);
+}
+
+void playShotSound() {
+  tone(BUZZER_PIN, 1200);
+  delay(30);
+  tone(BUZZER_PIN, 800);
+  delay(40);
+  noTone(BUZZER_PIN);
+}
+
+void playHitSound() {
+  tone(BUZZER_PIN, 300);
+  delay(100);
+  noTone(BUZZER_PIN);
+}
+
+void playReloadSound() {
+  tone(BUZZER_PIN, 600);
+  delay(50);
+  noTone(BUZZER_PIN);
+  delay(30);
+  tone(BUZZER_PIN, 800);
+  delay(50);
+  noTone(BUZZER_PIN);
+}
+
+// ---------- Utilities ----------
+inline bool isWall(float x, float y) {
+  int mx = (int)x;
+  int my = (int)y;
+  if (mx < 0 || mx >= MAP_W || my < 0 || my >= MAP_H) return true;
+  return worldMap[my][mx] > 0;
+}
+
+float distance(float x1, float y1, float x2, float y2) {
+  return sqrt((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1));
+}
+
+// ---------- Enemy AI ----------
+void updateEnemy() {
+  if (!enemyAlive) return;
+  
+  unsigned long now = millis();
+  if (now - lastEnemyMove > 1000) { // Move every second
+    // Simple movement toward player
+    float dx = posX - enemyX;
+    float dy = posY - enemyY;
+    float dist = sqrt(dx*dx + dy*dy);
+    
+    if (dist < 8.0f && dist > 1.5f) { // Chase player but keep distance
+      dx /= dist;
+      dy /= dist;
+      
+      float newX = enemyX + dx * 0.3f;
+      float newY = enemyY + dy * 0.3f;
+      
+      if (!isWall(newX, enemyY)) enemyX = newX;
+      if (!isWall(enemyX, newY)) enemyY = newY;
+    }
+    
+    lastEnemyMove = now;
+  }
+}
+
+// ---------- Weapon System ----------
+void renderWeapon() {
+  int weaponX = (SCREEN_W - 16) / 2;
+  int weaponY = SCREEN_H - 20;
+  
+  // Bobbing effect
+  if (weaponMoving) {
+    weaponBob = sin((millis() - lastWeaponBob) * 0.015f) * 3.0f;
+    weaponY += (int)weaponBob;
+  }
+  
+  // Draw weapon sprite
+  for (int y = 0; y < 16; y++) {
+    for (int x = 0; x < 16; x++) {
+      if (weaponSprite[weaponFrame][y] & (1 << (15 - x))) {
+        display.drawPixel(weaponX + x, weaponY + y, SSD1306_WHITE);
+      }
+    }
+  }
+  
+  // Muzzle flash when firing
+  if (isFiring && millis() - lastShot < 100) {
+    int flashX = weaponX + 12;
+    int flashY = weaponY - 4;
+    for (int y = 0; y < 8; y++) {
+      for (int x = 0; x < 8; x++) {
+        if (muzzleFlash[y] & (1 << (7 - x))) {
+          display.drawPixel(flashX + x, flashY + y, SSD1306_WHITE);
+        }
+      }
+    }
+  }
+}
+
+void shoot() {
+  if (ammo <= 0) {
+    playSound(200, 100);
+    return;
+  }
+  
+  ammo--;
+  isFiring = true;
+  weaponFrame = 1;
+  lastShot = millis();
+  playShotSound();
+  
+  // Check if hit enemy
+  if (enemyAlive) {
+    // Simple hit detection - check if enemy is in front of player
+    float dx = enemyX - posX;
+    float dy = enemyY - posY;
+    float dot = dx * dirX + dy * dirY;
+    
+    if (dot > 0) { // Enemy is in front
+      float dist = distance(posX, posY, enemyX, enemyY);
+      if (dist < 3.0f) { // Close enough to hit
+        enemyHealth -= 34.0f; // 3 shots to kill
+        playHitSound();
+        score += 10;
+        
+        if (enemyHealth <= 0) {
+          enemyAlive = false;
+          score += 100;
+          // Respawn enemy after delay
+          unsigned long respawnTimer = millis();
+          if (millis() - respawnTimer > 5000) {
+            enemyX = random(2, MAP_W-2) + 0.5f;
+            enemyY = random(2, MAP_H-2) + 0.5f;
+            enemyHealth = 100.0f;
+            enemyAlive = true;
+          }
+        }
+      }
+    }
+  }
+  
+  // Auto-reload when empty
+  if (ammo == 0) {
+    playReloadSound();
+    delay(200);
+    ammo = MAX_AMMO;
+  }
+}
+
+// ---------- Rendering ----------
+void renderFrame() {
+  display.clearDisplay();
+
+  // Render 3D world
+  for (int x = 0; x < RENDER_W; x++) {
+    float cameraX = 2.0f * x / (float)RENDER_W - 1.0f;
+    float rayDirX = dirX + planeX * cameraX;
+    float rayDirY = dirY + planeY * cameraX;
+
+    int mapX = (int)posX;
+    int mapY = (int)posY;
+
+    float deltaDistX = (rayDirX == 0) ? 1e30f : fabsf(1.0f / rayDirX);
+    float deltaDistY = (rayDirY == 0) ? 1e30f : fabsf(1.0f / rayDirY);
+    float sideDistX, sideDistY;
+    int stepX, stepY;
+    int hit = 0;
+    int side = 0;
+
+    if (rayDirX < 0) { stepX = -1; sideDistX = (posX - mapX) * deltaDistX; }
+    else { stepX = 1; sideDistX = (mapX + 1.0f - posX) * deltaDistX; }
+    if (rayDirY < 0) { stepY = -1; sideDistY = (posY - mapY) * deltaDistY; }
+    else { stepY = 1; sideDistY = (mapY + 1.0f - posY) * deltaDistY; }
+
+    while (hit == 0) {
+      if (sideDistX < sideDistY) { sideDistX += deltaDistX; mapX += stepX; side = 0; }
+      else { sideDistY += deltaDistY; mapY += stepY; side = 1; }
+      if (mapX >= 0 && mapX < MAP_W && mapY >= 0 && mapY < MAP_H) {
+        if (worldMap[mapY][mapX] > 0) hit = worldMap[mapY][mapX];
+      } else { hit = 1; }
+    }
+
+    float perpWallDist = (side == 0) ? (mapX - posX + (1 - stepX) / 2.0f) / rayDirX
+                                     : (mapY - posY + (1 - stepY) / 2.0f) / rayDirY;
+    if (perpWallDist <= 0.001f) perpWallDist = 0.001f;
+
+    int lineHeight = (int)(SCREEN_H / perpWallDist);
+    int drawStart = -lineHeight / 2 + SCREEN_H / 2;
+    if (drawStart < 0) drawStart = 0;
+    int drawEnd = lineHeight / 2 + SCREEN_H / 2;
+    if (drawEnd >= SCREEN_H) drawEnd = SCREEN_H - 1;
+
+    int sx = x * SCALE;
+    int h = drawEnd - drawStart + 1;
+    if (h > 0) display.fillRect(sx, drawStart, SCALE, h, SSD1306_WHITE);
+
+    if (perpWallDist > 4.0f) {
+      if (drawStart < SCREEN_H) display.drawFastVLine(sx, drawStart, 1, SSD1306_BLACK);
+    }
+  }
+
+  // Render weapon
+  renderWeapon();
+
+  // Render HUD
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  // Ammo counter
+  display.setCursor(2, SCREEN_H - 10);
+  display.print("AMMO:");
+  display.print(ammo);
+  
+  // Score
+  display.setCursor(SCREEN_W - 30, 2);
+  display.print("S:");
+  display.print(score);
+  
+  // Enemy health if visible
+  if (enemyAlive && distance(posX, posY, enemyX, enemyY) < 5.0f) {
+    display.setCursor(SCREEN_W - 30, SCREEN_H - 10);
+    display.print("E:");
+    display.print((int)enemyHealth);
+  }
+
+  display.display();
+}
+
+// ---------- Input ----------
+void handleInput(float dt) {
+  static int centerX = -1, centerY = -1;
+  
+  if (centerX == -1) {
+    centerX = analogRead(JOY_X_PIN);
+    centerY = analogRead(JOY_Y_PIN);
+  }
+  
+  int rawX = analogRead(JOY_X_PIN);
+  int rawY = analogRead(JOY_Y_PIN);
+  bool btn = digitalRead(JOY_BTN_PIN) == LOW;
+
+  float nx = (rawX - centerX) / 1024.0f;
+  float ny = (rawY - centerY) / 1024.0f;
+  
+  const float DEADZONE = 0.15f;
+  if (fabsf(nx) < DEADZONE) nx = 0;
+  if (fabsf(ny) < DEADZONE) ny = 0;
+  
+  nx = constrain(nx, -1.0f, 1.0f);
+  ny = constrain(ny, -1.0f, 1.0f);
+
+  float moveStep = -ny * MOVE_SPEED * dt;
+  float rotStep = nx * ROT_SPEED * dt;
+
+  bool wasMoving = weaponMoving;
+  
+  bool moved = false;
+  
+  if (fabsf(rotStep) > 0.001f) {
+    float oldDirX = dirX;
+    float c = cosf(rotStep), s = sinf(rotStep);
+    dirX = dirX * c - dirY * s;
+    dirY = oldDirX * s + dirY * c;
+    float oldPlaneX = planeX;
+    planeX = planeX * c - planeY * s;
+    planeY = oldPlaneX * s + planeY * c;
+  }
+
+  if (fabsf(moveStep) > 0.001f) {
+    float newX = posX + dirX * moveStep;
+    float newY = posY + dirY * moveStep;
+    
+    bool blocked = false;
+    if (!isWall(newX, posY)) posX = newX; else blocked = true;
+    if (!isWall(posX, newY)) posY = newY; else blocked = blocked || true;
+    moved = !blocked;
+  }
+
+  weaponMoving = (fabsf(moveStep) > 0.001f) || (fabsf(rotStep) > 0.001f);
+  if (weaponMoving && !wasMoving) {
+    lastWeaponBob = millis();
+  }
+
+  // Update weapon animation
+  if (isFiring && millis() - lastShot > 100) {
+    isFiring = false;
+    weaponFrame = 0;
+  }
+
+  // Shooting
+  static unsigned long lastBtnPress = 0;
+  if (btn && millis() - lastBtnPress > 300) {
+    shoot();
+    lastBtnPress = millis();
+  }
+
+  // Reset game
+  static unsigned long lastReset = 0;
+  static bool resetHeld = false;
+  if (btn) {
+    if (!resetHeld) {
+      resetHeld = true;
+      lastReset = millis();
+    } else if (millis() - lastReset > 2000) {
+      // Reset the game
+      posX = 3.5f; posY = 3.5f;
+      dirX = -1; dirY = 0;
+      planeX = 0; planeY = 0.66f;
+      enemyX = 7.5f; enemyY = 7.5f;
+      enemyAlive = true;
+      enemyHealth = 100.0f;
+      ammo = MAX_AMMO;
+      score = 0;
+      playSound(1200, 40, 30);
+      playSound(1600, 40, 0);
+      resetHeld = false;
+    }
+  } else {
+    resetHeld = false;
+  }
+}
+
+// ---------- Setup & Loop ----------
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(7, 6);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.display();
+
+  pinMode(JOY_BTN_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+
+  // Initialize random seed for enemy respawn
+  randomSeed(analogRead(JOY_X_PIN) + analogRead(JOY_Y_PIN));
+
+  delay(100);
+  Serial.println("Raycaster with Enemy started");
+
+  lastTime = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0f;
+  if (dt <= 0 || dt > 0.1f) dt = 0.016f;
+  lastTime = now;
+
+  handleInput(dt);
+  updateEnemy();
+  renderFrame();
+
+  static unsigned long fpsTimer = 0;
+  static int frames = 0;
+  frames++;
+  if (now - fpsTimer > 1000) {
+    float fps = frames * 1000.0f / (now - fpsTimer);
+    Serial.print("FPS: ");
+    Serial.println((int)fps);
+    fpsTimer = now;
+    frames = 0;
+  }
+}
