@@ -1,0 +1,365 @@
+// ESP32-C3 SSD1306 Raycaster with Weapon
+// Target: ESP32-C3, SSD1306 128x64 (I2C), analog joystick, buzzer
+// Wiring (example):
+//   OLED SDA -> GPIO 7
+//   OLED SCL -> GPIO 6
+//   Joystick X -> GPIO 0 (A0)
+//   Joystick Y -> GPIO 1 (A1)
+//   Joystick BTN -> GPIO 2 (pull-up)
+//   Buzzer -> GPIO 5
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------- Display config ----------
+#define SCREEN_W 128
+#define SCREEN_H 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, OLED_RESET);
+
+// ---------- Rendering settings (optimized) ----------
+const int RENDER_W = 64;           // columns to raycast
+const int SCALE = SCREEN_W / RENDER_W; // horizontal scale (2)
+
+// ---------- Pins ----------
+const int JOY_X_PIN = 0; // A0
+const int JOY_Y_PIN = 1; // A1
+const int JOY_BTN_PIN = 2; // digital input (pull-up)
+const int BUZZER_PIN = 5;
+
+// ---------- Weapon sprite ----------
+const uint8_t weaponSprite[8] = {
+  0b00011000,  //    ##   
+  0b00111100,  //   ####  
+  0b01111110,  //  ###### 
+  0b11111111,  // ########
+  0b11111111,  // ########
+  0b01111110,  //  ###### 
+  0b00111100,  //   ####  
+  0b00011000   //    ##   
+};
+
+// Weapon animation
+float weaponBob = 0.0f;
+bool weaponMoving = false;
+unsigned long lastWeaponBob = 0;
+unsigned long lastFlash = 0;
+
+// ---------- Player / camera ----------
+float posX = 3.5f, posY = 3.5f;
+float dirX = -1.0f, dirY = 0.0f;
+float planeX = 0.0f, planeY = 0.66f; // FOV
+
+const float MOVE_SPEED = 2.8f; // squares/sec (tweak)
+const float ROT_SPEED  = 1.5f; // REDUCED rad/sec
+
+// ---------- Map (16x16) ----------
+const int MAP_W = 16;
+const int MAP_H = 16;
+const uint8_t worldMap[MAP_H][MAP_W] = {
+  {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,1,1,1,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,1,0,1,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,1,0,1,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,1,0,1,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,1,1,1,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+  {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}
+};
+
+// ---------- Timing ----------
+unsigned long lastTime = 0;
+
+// ---------- Audio helpers ----------
+void beep(unsigned int freq, unsigned int ms) {
+  if (freq == 0) {
+    noTone(BUZZER_PIN);
+    delay(ms);
+    return;
+  }
+  tone(BUZZER_PIN, freq);
+  delay(ms);
+  noTone(BUZZER_PIN);
+}
+
+// ---------- Utilities ----------
+inline bool isWall(float x, float y) {
+  int mx = (int)x;
+  int my = (int)y;
+  if (mx < 0 || mx >= MAP_W || my < 0 || my >= MAP_H) return true;
+  return worldMap[my][mx] > 0;
+}
+
+// ---------- Weapon rendering ----------
+void renderWeapon() {
+  // Weapon position (centered at bottom)
+  int weaponX = (SCREEN_W - 8) / 2;
+  int weaponY = SCREEN_H - 16; // Position above bottom
+  
+  // Apply bobbing effect when moving
+  if (weaponMoving) {
+    weaponBob = sin((millis() - lastWeaponBob) * 0.01f) * 2.0f;
+    weaponY += (int)weaponBob;
+  } else {
+    weaponBob = 0.0f;
+  }
+  
+  // Draw weapon sprite
+  for (int y = 0; y < 8; y++) {
+    for (int x = 0; x < 8; x++) {
+      if (weaponSprite[y] & (1 << (7 - x))) {
+        display.drawPixel(weaponX + x, weaponY + y, SSD1306_WHITE);
+      }
+    }
+  }
+  
+  // Simple "muzzle flash" effect occasionally
+  if (millis() - lastFlash < 100) { // Flash for 100ms
+    display.fillRect(weaponX + 6, weaponY - 3, 4, 2, SSD1306_WHITE);
+  }
+  
+  // Random occasional flash (like Doom's idle animation)
+  if (random(1000) < 2 && millis() - lastFlash > 2000) {
+    lastFlash = millis();
+  }
+}
+
+// ---------- Rendering ----------
+void renderFrame() {
+  display.clearDisplay();
+
+  for (int x = 0; x < RENDER_W; x++) {
+    // camera x
+    float cameraX = 2.0f * x / (float)RENDER_W - 1.0f;
+    float rayDirX = dirX + planeX * cameraX;
+    float rayDirY = dirY + planeY * cameraX;
+
+    int mapX = (int)posX;
+    int mapY = (int)posY;
+
+    float deltaDistX = (rayDirX == 0) ? 1e30f : fabsf(1.0f / rayDirX);
+    float deltaDistY = (rayDirY == 0) ? 1e30f : fabsf(1.0f / rayDirY);
+    float sideDistX, sideDistY;
+    int stepX, stepY;
+    int hit = 0;
+    int side = 0;
+
+    if (rayDirX < 0) { stepX = -1; sideDistX = (posX - mapX) * deltaDistX; }
+    else { stepX = 1; sideDistX = (mapX + 1.0f - posX) * deltaDistX; }
+    if (rayDirY < 0) { stepY = -1; sideDistY = (posY - mapY) * deltaDistY; }
+    else { stepY = 1; sideDistY = (mapY + 1.0f - posY) * deltaDistY; }
+
+    while (hit == 0) {
+      if (sideDistX < sideDistY) { sideDistX += deltaDistX; mapX += stepX; side = 0; }
+      else { sideDistY += deltaDistY; mapY += stepY; side = 1; }
+      if (mapX >= 0 && mapX < MAP_W && mapY >= 0 && mapY < MAP_H) {
+        if (worldMap[mapY][mapX] > 0) hit = worldMap[mapY][mapX];
+      } else { hit = 1; }
+    }
+
+    float perpWallDist = (side == 0) ? (mapX - posX + (1 - stepX) / 2.0f) / rayDirX
+                                     : (mapY - posY + (1 - stepY) / 2.0f) / rayDirY;
+    if (perpWallDist <= 0.001f) perpWallDist = 0.001f; // avoid div0
+
+    int lineHeight = (int)(SCREEN_H / perpWallDist);
+    int drawStart = -lineHeight / 2 + SCREEN_H / 2;
+    if (drawStart < 0) drawStart = 0;
+    int drawEnd = lineHeight / 2 + SCREEN_H / 2;
+    if (drawEnd >= SCREEN_H) drawEnd = SCREEN_H - 1;
+
+    // For monochrome: fill column (scaled)
+    int sx = x * SCALE;
+    int h = drawEnd - drawStart + 1;
+    if (h > 0) display.fillRect(sx, drawStart, SCALE, h, SSD1306_WHITE);
+
+    // Optional: simple shading by drawing an extra pixel pattern for far walls (cheap)
+    if (perpWallDist > 4.0f) {
+      // clear top pixel of column to give a sense of distance
+      if (drawStart < SCREEN_H) display.drawFastVLine(sx, drawStart, 1, SSD1306_BLACK);
+    }
+  }
+
+  // Render the weapon on top of the 3D scene
+  renderWeapon();
+
+  display.display();
+}
+
+// ---------- Input & movement ----------
+unsigned long lastStepTime = 0;
+
+void handleInput(float dt) {
+  // Read and calibrate joystick
+  static int centerX = -1, centerY = -1;
+  
+  // Auto-calibrate center on first read
+  if (centerX == -1) {
+    centerX = analogRead(JOY_X_PIN);
+    centerY = analogRead(JOY_Y_PIN);
+    Serial.print("Calibrated center: X=");
+    Serial.print(centerX);
+    Serial.print(" Y=");
+    Serial.println(centerY);
+  }
+  
+  int rawX = analogRead(JOY_X_PIN);
+  int rawY = analogRead(JOY_Y_PIN);
+  bool btn = digitalRead(JOY_BTN_PIN) == LOW;
+
+  // Debug joystick values occasionally
+  static unsigned long lastDebug = 0;
+  if (millis() - lastDebug > 1000) {
+    Serial.print("Joystick - X: ");
+    Serial.print(rawX);
+    Serial.print(" Y: ");
+    Serial.print(rawY);
+    Serial.print(" Btn: ");
+    Serial.println(btn);
+    lastDebug = millis();
+  }
+
+  // Calculate normalized values with deadzone
+  float nx = (rawX - centerX) / 1024.0f;  // Reduced range for better control
+  float ny = (rawY - centerY) / 1024.0f;
+  
+  // Apply larger deadzone to prevent drift
+  const float DEADZONE = 0.15f;
+  if (fabsf(nx) < DEADZONE) nx = 0;
+  if (fabsf(ny) < DEADZONE) ny = 0;
+  
+  // Clamp values
+  nx = constrain(nx, -1.0f, 1.0f);
+  ny = constrain(ny, -1.0f, 1.0f);
+
+  float moveStep = -ny * MOVE_SPEED * dt; // forward/back
+  float rotStep = nx * ROT_SPEED * dt;    // left/right rotate
+
+  // Track movement for weapon animation
+  bool wasMoving = weaponMoving;
+  
+  bool moved = false;
+  
+  // Only rotate if there's significant input
+  if (fabsf(rotStep) > 0.001f) {
+    float oldDirX = dirX;
+    float c = cosf(rotStep), s = sinf(rotStep);
+    dirX = dirX * c - dirY * s;
+    dirY = oldDirX * s + dirY * c;
+    float oldPlaneX = planeX;
+    planeX = planeX * c - planeY * s;
+    planeY = oldPlaneX * s + planeY * c;
+  }
+
+  if (fabsf(moveStep) > 0.001f) {
+    float newX = posX + dirX * moveStep;
+    float newY = posY + dirY * moveStep;
+    
+    // collision
+    bool blocked = false;
+    if (!isWall(newX, posY)) posX = newX; else blocked = true;
+    if (!isWall(posX, newY)) posY = newY; else blocked = blocked || true;
+    moved = !blocked;
+    
+    if (blocked && millis() - lastStepTime > 120) {
+      beep(220, 80);
+      lastStepTime = millis();
+    }
+  }
+
+  // Update weapon animation state
+  weaponMoving = (fabsf(moveStep) > 0.001f) || (fabsf(rotStep) > 0.001f);
+  
+  // Start bobbing timer when movement starts
+  if (weaponMoving && !wasMoving) {
+    lastWeaponBob = millis();
+  }
+
+  // Footstep sounds
+  if (moved) {
+    if (millis() - lastStepTime > 160) {
+      beep(900, 30);
+      lastStepTime = millis();
+    }
+  }
+
+  // Shooting effect when button pressed
+  static unsigned long lastShot = 0;
+  if (btn && (millis() - lastShot > 500)) { // Rate limit shots
+    lastFlash = millis(); // Trigger muzzle flash
+    beep(1500, 50); // Shooting sound
+    lastShot = millis();
+  }
+
+  // Reset position on button press
+  static unsigned long lastBtn = 0;
+  if (btn && (millis() - lastBtn > 300)) {
+    posX = 3.5f; posY = 3.5f; 
+    dirX = -1; dirY = 0; 
+    planeX = 0; planeY = 0.66f;
+    beep(1200, 40);
+    delay(30);
+    beep(1600, 40);
+    lastBtn = millis();
+    Serial.println("Reset position");
+  }
+}
+
+// ---------- Setup & Loop ----------
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting Raycaster with Weapon...");
+
+  // I2C init with specific pins for ESP32-C3
+  Wire.begin(7, 6); // SDA, SCL
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.display();
+
+  pinMode(JOY_BTN_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+
+  // Read joystick center values
+  delay(100); // Let joystick settle
+  Serial.println("Setup complete");
+
+  lastTime = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0f;
+  if (dt <= 0 || dt > 0.1f) dt = 0.016f; // Cap delta time
+  lastTime = now;
+
+  handleInput(dt);
+  renderFrame();
+
+  // FPS display
+  static unsigned long fpsTimer = 0;
+  static int frames = 0;
+  frames++;
+  if (now - fpsTimer > 1000) {
+    float fps = frames * 1000.0f / (now - fpsTimer);
+    fpsTimer = now; 
+    frames = 0;
+    
+    // Display FPS on serial for debugging
+    Serial.print("FPS: ");
+    Serial.println((int)fps);
+  }
+}
